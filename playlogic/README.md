@@ -253,3 +253,6 @@ playlogic/
     ├── app.py             # FastAPI application (HTTP + WebSocket endpoints)
     └── Dockerfile         # Container image definition
 ```
+
+
+Message by me
