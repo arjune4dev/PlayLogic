@@ -37,10 +37,10 @@ except Exception as e:  # pragma: no cover
 
 try:
     from ..models import PlaylogicAction, PlaylogicObservation
-    from .playlogic_environment import PlaylogicEnvironment
+    from .environment import PlaylogicEnvironment
 except ModuleNotFoundError:
     from models import PlaylogicAction, PlaylogicObservation
-    from server.playlogic_environment import PlaylogicEnvironment
+    from PlayLogic.playlogic.server.environment import PlaylogicEnvironment
 
 
 # Create the app with web interface and README integration
