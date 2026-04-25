@@ -10,6 +10,7 @@ GOAL_HEIGHT  = 2.44   # not used in 2D, but for reference
 GOAL_Y_CENTER = 34.0
 GOAL_Y_MIN   = GOAL_Y_CENTER - GOAL_WIDTH / 2
 GOAL_Y_MAX   = GOAL_Y_CENTER + GOAL_WIDTH / 2
+SPACING_THRESHOLD = 2.0   # distance (m) below which two teammates are considered "bunched"
 
 DT = 0.1
 
@@ -21,6 +22,8 @@ ACCELERATION_DRIBBLE = 4.0
 AGILITY = 10.0            # max angular velocity (rad/s) for velocity change
 
 # Ball dynamics
+PLAYER_RADIUS = 0.5
+BALL_RADIUS   = 0.11
 AIR_DENSITY = 1.225
 BALL_MASS = 0.45           # kg
 BALL_RADIUS = 0.11

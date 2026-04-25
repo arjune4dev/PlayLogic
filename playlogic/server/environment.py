@@ -2,7 +2,7 @@ import json, random
 import numpy as np
 from copy import deepcopy
 
-# OpenEnv fallback (for local testing)
+# OpenEnv fallback
 try:
     from openenv import Environment
 except ImportError:
@@ -10,8 +10,9 @@ except ImportError:
         def state(self):
             return {}
 
+from playlogic.models import Observation, Action
 from playlogic.server.physics import *
-from playlogic.server.rewards import compute_reward, compute_graph_density
+from playlogic.server.rewards import compute_reward_for_team, compute_graph_density
 
 class MultiAgentFootball(Environment):
     def __init__(self):
@@ -50,34 +51,29 @@ class MultiAgentFootball(Environment):
         team_b = init_team_b()
         self._state['players'] = team_a + team_b
         self._state['ball'] = init_ball()
-        # random kick-off
         carrier = random.choice(team_a if random.random() < 0.5 else team_b)
         carrier['has_ball'] = True
         self._state['possession_team'] = carrier['team']
         self._state['prev_graph_density_A'] = compute_graph_density(self._state['players'], 'A')
         self._state['prev_graph_density_B'] = compute_graph_density(self._state['players'], 'B')
-        # Return joint observation
         obs_dict = {p['id']: self.get_player_observation(p['id']) for p in self._state['players']}
         return Observation(text=json.dumps(obs_dict))
 
     def step(self, action: Action):
-        # Parse joint action: {"0": "MOVE 1 2", "1": "PASS 3", ...}
+        # Parse joint action
         try:
             actions_dict = json.loads(action.text)
             if not isinstance(actions_dict, dict):
-                raise ValueError("Action must be a dict")
-            # Convert keys to int
+                raise ValueError
             joint_action = {int(k): v for k, v in actions_dict.items()}
         except Exception:
             return Observation(text="{}"), {'A': -1.0, 'B': -1.0}, True, {}
 
-        # Store previous state for reward
         prev_players = [p.copy() for p in self._state['players']]
         prev_ball = self._state['ball'].copy()
         prev_possession = self._state['possession_team']
         prev_step = self._state['step']
 
-        # Separate teams
         team_a = [p for p in self._state['players'] if p['team'] == 'A']
         team_b = [p for p in self._state['players'] if p['team'] == 'B']
 
@@ -86,8 +82,10 @@ class MultiAgentFootball(Environment):
             act_str = joint_action.get(p['id'], "HOLD")
             p_action = self._parse_action(act_str)
             if p_action['type'] == 'move':
-                p['vel'] = p_action['vector']
+                # FIXED: use new per‑player movement function
+                apply_movement(p, p_action['vector'])
             else:
+                # stop when passing/shooting/holding
                 p['vel'] = np.zeros(2)
 
             if p['has_ball'] and p_action['type'] in ('pass', 'shoot'):
@@ -116,8 +114,11 @@ class MultiAgentFootball(Environment):
                     self._state['ball']['last_kicker_team'] = p['team']
                     self._state['possession_team'] = None
 
-        # --- 2. Physics update ---
-        update_positions(self._state['players'], self._state['ball'])
+        # --- 2. Physics update (FIXED) ---
+        # Move players
+        update_player_positions(self._state['players'])
+        # Move ball
+        update_ball(self._state['ball'], self._state['players'])
 
         # --- 3. Possession ---
         poss_id = check_possession(self._state['players'], self._state['ball'])
@@ -151,15 +152,13 @@ class MultiAgentFootball(Environment):
                 if pass_team == 'A':
                     passer = self._player_by_id(self._state['pass_from'], team_a)
                     receiver = self._player_by_id(self._state['pass_to'], team_a)
-                    if passer and receiver:
-                        if passer['pos'][0] < FIELD_WIDTH/2 and receiver['pos'][0] >= FIELD_WIDTH/2:
-                            self._state['build_out_progress_A'] += 1
+                    if passer and receiver and passer['pos'][0] < FIELD_WIDTH/2 and receiver['pos'][0] >= FIELD_WIDTH/2:
+                        self._state['build_out_progress_A'] += 1
                 else:
                     passer = self._player_by_id(self._state['pass_from'], team_b)
                     receiver = self._player_by_id(self._state['pass_to'], team_b)
-                    if passer and receiver:
-                        if passer['pos'][0] > FIELD_WIDTH/2 and receiver['pos'][0] <= FIELD_WIDTH/2:
-                            self._state['build_out_progress_B'] += 1
+                    if passer and receiver and passer['pos'][0] > FIELD_WIDTH/2 and receiver['pos'][0] <= FIELD_WIDTH/2:
+                        self._state['build_out_progress_B'] += 1
                 self._state['pass_info'] = None
             elif status in ('intercepted', 'timeout'):
                 self._state['pass_info'] = None
@@ -168,7 +167,6 @@ class MultiAgentFootball(Environment):
 
         # --- 5. Graph density ---
         if self._state['pass_result'] == 'success':
-            # update for both teams
             old_density_A = self._state['prev_graph_density_A']
             old_density_B = self._state['prev_graph_density_B']
             new_density_A = compute_graph_density(self._state['players'], 'A')
@@ -188,23 +186,16 @@ class MultiAgentFootball(Environment):
             self._state['score']['B'] += 1
             self._reset_after_goal()
 
-        ob, new_team = out_of_bounds(self._state['ball'])
+        ob, restart_type, new_team = out_of_bounds(self._state['ball'])
         if ob:
-            self._state['possession_team'] = new_team
-            for p in self._state['players']:
-                p['has_ball'] = False
-            candidates = [p for p in self._state['players'] if p['team'] == new_team]
-            if candidates:
-                random.choice(candidates)['has_ball'] = True
+            self._handle_out_of_bounds(restart_type, new_team)
 
         # --- 7. Press tracking (simplified) ---
-        # ... omitted for brevity, similar to previous but per team.
+        # ... (omitted brevity, same as before but with the new physics)
 
         self._state['step'] += 1
 
-        # --- 8. Reward for both teams ---
-        # We compute reward from the perspective of each team.
-        # For simplicity, compute reward_A using previous state, and reward_B as negative of reward_A? Actually we design rewards as zero-sum: score reward for A is +5 and for B is -5 (if we pass team identifier). We'll compute both.
+        # --- 8. Compute rewards for both teams ---
         prev_state_dict = {
             'players': prev_players,
             'ball': prev_ball,
@@ -212,9 +203,8 @@ class MultiAgentFootball(Environment):
             'score': {'A': self._state['score']['A'], 'B': self._state['score']['B']},
             'step': prev_step,
         }
-        # We'll slightly modify compute_reward to take a 'team' parameter? Better: define a function that returns reward for team A and for team B.
-        # For brevity, I'll define a new method inside environment: _compute_rewards()
-        reward_A, reward_B = self._compute_rewards(prev_state_dict)
+        reward_A, _ = compute_reward_for_team(self._state, prev_state_dict, 'A')
+        reward_B, _ = compute_reward_for_team(self._state, prev_state_dict, 'B')
 
         done = (self._state['step'] >= MAX_EPISODE_STEPS or
                 abs(self._state['score']['A'] - self._state['score']['B']) >= MAX_GOAL_DIFF)
@@ -222,6 +212,7 @@ class MultiAgentFootball(Environment):
         obs_dict = {p['id']: self.get_player_observation(p['id']) for p in self._state['players']}
         return Observation(text=json.dumps(obs_dict)), {'A': reward_A, 'B': reward_B}, done, {}
 
+    # ---------- Helper methods unchanged ----------
     def get_player_observation(self, player_id):
         p = self._player_by_id(player_id, self._state['players'])
         if not p:
@@ -232,7 +223,6 @@ class MultiAgentFootball(Environment):
         b = self._state['ball']
         s += f"Ball: ({b['pos'][0]:.1f},{b['pos'][1]:.1f})\n"
         s += f"Score: {self._state['score']['A']}-{self._state['score']['B']}\n"
-        # Nearby teammates & opponents (within 25m)
         s += "Nearby:\n"
         for other in self._state['players']:
             if other['id'] == player_id:
@@ -264,15 +254,14 @@ class MultiAgentFootball(Environment):
         else:
             return {'type': 'hold'}
 
-    def _compute_rewards(self, prev_state_dict):
-        # Use reward components to compute for team A and B separately.
-        # We'll reuse compute_reward but with a flag? Alternatively, just compute for A and then reverse for B.
-        # I'll provide a simplified method: reward_A = compute_reward(self._state, prev_state_dict, 'A')
-        # We need to update rewards.py accordingly.
-        from playlogic.server.rewards import compute_reward_for_team
-        reward_A = compute_reward_for_team(self._state, prev_state_dict, 'A')
-        reward_B = compute_reward_for_team(self._state, prev_state_dict, 'B')
-        return reward_A, reward_B
+    def _handle_out_of_bounds(self, restart_type, team):
+        # simple restart: give ball to a random player of the team
+        self._state['possession_team'] = team
+        for p in self._state['players']:
+            p['has_ball'] = False
+        candidates = [p for p in self._state['players'] if p['team'] == team]
+        if candidates:
+            random.choice(candidates)['has_ball'] = True
 
     def _reset_after_goal(self):
         self._state['players'] = init_team_a() + init_team_b()
