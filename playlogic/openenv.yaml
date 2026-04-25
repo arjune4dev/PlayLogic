@@ -1,7 +1,13 @@
-spec_version: 1
-name: playlogic
-type: space
-runtime: fastapi
-app: server.app:app
-port: 8000
-
+name: FootballTacticsMARL
+version: 0.1.0
+description: Multi-agent football tactical simulation for LLM training with formation learning and passing network optimization.
+author: Your Team
+tags: [rl, multi-agent, sports, football, llm]
+python: "3.10"
+entrypoint: server:app
+requirements:
+  - numpy
+  - networkx
+  - scipy
+  - fastapi
+  - uvicorn
