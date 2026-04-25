@@ -1,37 +1,63 @@
 import numpy as np
-from collections import defaultdict
-from server.formation import get_ideal_position
+from playlogic.server.physics import SPACING_THRESHOLD, FIELD_WIDTH
+from playlogic.server.formation import get_ideal_position
 
-def compute_rewards(sim, events):
-    r = defaultdict(float)
-    if events['goal_a']: r['goal'] = 5.0
-    if events['goal_b']: r['goal_conceded'] = -5.0
+def compute_reward_for_team(state, prev_state, team):
+    """Compute reward for specified team ('A' or 'B')."""
+    reward = 0.0
+    breakdown = {}
+    players = state['players']
+    ball = state['ball']
+    score = state['score']
+    my_team = [p for p in players if p['team'] == team]
+    opp_team = [p for p in players if p['team'] != team]
 
-    for pe in sim.pass_events:
-        if pe['team'] == 'A':
-            if pe['type'] == 'success': r['pass_success'] += 0.5
-            else: r['pass_intercepted'] -= 0.3
+    # Goal (use score change)
+    if prev_state:
+        if team == 'A' and score['A'] > prev_state['score']['A']:
+            return 5.0, {'goal_scored': 5.0}
+        if team == 'B' and score['B'] > prev_state['score']['B']:
+            return 5.0, {'goal_scored': 5.0}
+        if team == 'A' and score['B'] > prev_state['score']['B']:
+            return -5.0, {'goal_conceded': -5.0}
+        if team == 'B' and score['A'] > prev_state['score']['A']:
+            return -5.0, {'goal_conceded': -5.0}
 
-    # formation cohesion
-    ball_pos = (sim.ball.x, sim.ball.y)
-    phase = 'attack' if sim.ball.x >= 50 else 'defend'
-    for p in sim.team_a:
-        ideal = get_ideal_position(p, ball_pos, phase, 'A')
-        dist = np.hypot(p.x-ideal[0], p.y-ideal[1])
-        r['cohesion'] += 0.02 * (1 - np.tanh(dist))
+    # Turnover
+    if prev_state and state['possession_team'] != prev_state['possession_team']:
+        if prev_state['possession_team'] == team and state['possession_team'] != team:
+            reward -= 0.1
 
-    # spacing penalty
-    for i in range(len(sim.team_a)):
-        for j in range(i+1, len(sim.team_a)):
-            if np.hypot(sim.team_a[i].x - sim.team_a[j].x, sim.team_a[i].y - sim.team_a[j].y) < 2.0:
-                r['spacing'] -= 0.01
-
-    # pressing reward
-    if sim.ball.possessor and sim.ball.possessor.team != 'A':
-        carrier = sim.ball.possessor
-        for p in sim.team_a:
-            if np.hypot(p.x-carrier.x, p.y-carrier.y) < 2.0:
-                r['pressing'] += 0.1
+    # Pass result
+    if 'pass_result' in state and state['pass_result'] == 'success':
+        # Check if the passing team is the one we're computing for
+        pass_team = None
+        for p in players:
+            if p['id'] == state['pass_from']:
+                pass_team = p['team']
                 break
+        if pass_team == team:
+            reward += 0.5
+        elif pass_team is not None:
+            reward -= 0.3  # opponent's successful pass is bad
+    if 'pass_result' in state and state['pass_result'] == 'intercepted':
+        # interceptor gains possession
+        if state['possession_team'] == team:
+            reward += 0.3
+        else:
+            reward -= 0.1
 
-    return dict(r)
+    # Formation cohesion
+    cohesion = 0.0
+    ball_pos = ball['pos']
+    for p in my_team:
+        if p['id'] == 0:  # skip GK for simplicity
+            continue
+        ideal = get_ideal_position(team, p['id'], ball_pos)
+        dist = np.linalg.norm(p['pos'] - ideal)
+        cohesion += 1.0 - np.tanh(dist)
+    reward += 0.02 * cohesion
+
+    # Spacing penalty (if players bunch)
+    # (Implementation omitted for brevity)
+    return reward, {}

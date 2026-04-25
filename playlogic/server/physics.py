@@ -1,252 +1,416 @@
-"""Realistic football physics – guaranteed goals, fast tackles."""
-import math, numpy as np
+import math
+import random
+import numpy as np
 
-FIELD_LENGTH, FIELD_WIDTH = 105.0, 68.0
-GOAL_WIDTH = 7.32
-GOAL_HALF = GOAL_WIDTH / 2
-GOAL_Y_MIN = (FIELD_WIDTH / 2) - GOAL_HALF
-GOAL_Y_MAX = (FIELD_WIDTH / 2) + GOAL_HALF
-MAX_SPEED = 9.0
-MAX_ACCEL = 7.0
-PLAYER_RADIUS = 0.5
-BALL_RADIUS = 0.11
+# ---------- Constants ----------
+FIELD_WIDTH  = 105.0
+FIELD_HEIGHT = 68.0
+GOAL_WIDTH   = 7.32
+GOAL_HEIGHT  = 2.44   # not used in 2D, but for reference
+GOAL_Y_CENTER = 34.0
+GOAL_Y_MIN   = GOAL_Y_CENTER - GOAL_WIDTH / 2
+GOAL_Y_MAX   = GOAL_Y_CENTER + GOAL_WIDTH / 2
+
 DT = 0.1
-BALL_FRICTION = 0.97
-TACKLE_DIST = 0.65
-POSS_DIST = 0.5 + BALL_RADIUS
-PASS_SPEED = 16.0
-SHOOT_SPEED = 22.0
-INTERCEPT_DIST = 1.2
 
-class Player:
-    def __init__(self, x, y, team, player_id):
-        self.x, self.y = x, y
-        self.vx, self.vy = 0.0, 0.0
-        self.team = team
-        self.id = player_id
-        self.has_ball = False
+# Player dynamics
+MAX_SPEED_FREE  = 8.0    # m/s
+MAX_SPEED_DRIBBLE = 6.5  # slower with ball
+ACCELERATION_FREE = 5.0  # m/s²
+ACCELERATION_DRIBBLE = 4.0
+AGILITY = 10.0            # max angular velocity (rad/s) for velocity change
 
-class Ball:
-    def __init__(self, x, y):
-        self.x, self.y = x, y
-        self.vx, self.vy = 0.0, 0.0
-        self.last_touch_team = None
-        self.possessor = None
+# Ball dynamics
+AIR_DENSITY = 1.225
+BALL_MASS = 0.45           # kg
+BALL_RADIUS = 0.11
+BALL_CROSS_SECTION = math.pi * BALL_RADIUS**2
+DRAG_COEFF = 0.25          # typical for smooth sphere
+ROLLING_FRICTION = 0.85    # factor per step when on ground
+SPIN_FACTOR = 0.0003       # very small, for realistic curve
+MAX_BALL_SPEED = 35.0      # hard shot
 
-class FootballSim:
-    def __init__(self):
-        self.team_a = []
-        self.team_b = []
-        self.ball = Ball(FIELD_LENGTH/2, FIELD_WIDTH/2)
-        self.score_a, self.score_b = 0, 0
-        self.step_count = 0
-        self.pass_events = []
-        self.passes_in_flight = []
-        self._init_players()
+# Pass & shot parameters
+PASS_SPEED = 22.0
+SHOT_SPEED = 28.0
+PASS_ACCURACY = 0.8        # base accuracy, reduced by distance & pressure
+SHOT_ACCURACY = 0.6
+PASS_TIME_STEPS = 5         # max steps for a pass to be considered "completed"
+PASS_ARRIVE_DIST = 1.5
+INTERCEPT_DIST = 1.2       # distance an opponent must be from ball path to attempt interception
+REACTION_TIME = 0.2        # seconds, simulated as steps delay
 
-    def _init_players(self):
-        from server.formation import get_initial_positions_team_a, get_initial_positions_team_b
-        pos_a = get_initial_positions_team_a()
-        pos_b = get_initial_positions_team_b()
-        self.team_a = [Player(*pos_a[i], 'A', i) for i in range(11)]
-        self.team_b = [Player(*pos_b[i], 'B', i) for i in range(11)]
+# Tackle
+TACKLE_DIST = 1.0
+TACKLE_ANGLE_THRESH = 60   # degrees; attacker must be within this angle of approach
+TACKLE_SUCCESS_BASE = 0.7
 
-    def reset(self):
-        self.score_a = self.score_b = 0
-        self.step_count = 0
-        from server.formation import get_initial_positions_team_a, get_initial_positions_team_b
-        pos_a = get_initial_positions_team_a()
-        pos_b = get_initial_positions_team_b()
-        for i, p in enumerate(self.team_a):
-            p.x = pos_a[i][0] + np.random.uniform(-0.5,0.5)
-            p.y = pos_a[i][1] + np.random.uniform(-0.5,0.5)
-            p.vx = p.vy = 0.0; p.has_ball = False
-        for i, p in enumerate(self.team_b):
-            p.x = pos_b[i][0] + np.random.uniform(-0.5,0.5)
-            p.y = pos_b[i][1] + np.random.uniform(-0.5,0.5)
-            p.vx = p.vy = 0.0; p.has_ball = False
-        self.ball.x, self.ball.y = FIELD_LENGTH/2, FIELD_WIDTH/2
-        self.ball.vx = self.ball.vy = 0.0
-        self.ball.last_touch_team = 'A'
-        self.ball.possessor = None
-        self._assign_ball_to_nearest('A')
-        self.pass_events.clear()
-        self.passes_in_flight.clear()
+# Offside
+OFFSIDE_LINE_BUF = 0.0     # level is onside
 
-    def all_players(self):
-        return self.team_a + self.team_b
+# Episode
+MAX_EPISODE_STEPS = 2000
+MAX_GOAL_DIFF = 5
 
-    def _assign_ball_to_nearest(self, team):
-        players = self.team_a if team == 'A' else self.team_b
-        if not players: return
-        best = min(players, key=lambda p: np.hypot(p.x-self.ball.x, p.y-self.ball.y))
-        best.has_ball = True
-        self.ball.possessor = best
-        self.ball.last_touch_team = team
-        self.ball.vx = self.ball.vy = 0.0
-        self.ball.x, self.ball.y = best.x, best.y
+# Helper
+def clamp(val, low, high):
+    return max(low, min(high, val))
 
-    def step(self, actions_a, actions_b):
-        self.pass_events.clear()
-        self._apply_actions('A', actions_a)
-        self._apply_actions('B', actions_b)
-        self._update_physics()
-        events = self._check_events()
-        self._update_possession()
-        self._update_passes()
-        self.step_count += 1
-        return events
+# ---------- Initialisation ----------
+def init_player(id, team, x, y, role=''):
+    return {
+        'id': id,
+        'team': team,
+        'role': role,
+        'pos': np.array([x, y], dtype=float),
+        'vel': np.zeros(2, dtype=float),
+        'has_ball': False,
+        'max_speed': MAX_SPEED_FREE,
+    }
 
-    def _apply_actions(self, team, actions):
-        players = self.team_a if team == 'A' else self.team_b
-        for p in players:
-            act = actions.get(p.id, {"hold": None})
-            if "move" in act:
-                dx, dy = act["move"]
-                mag = np.hypot(dx, dy)
-                if mag > MAX_SPEED:
-                    dx = dx / mag * MAX_SPEED; dy = dy / mag * MAX_SPEED
-                p.vx = p.vx * 0.3 + dx * 0.7
-                p.vy = p.vy * 0.3 + dy * 0.7
-            elif "shoot" in act and p.has_ball:
-                self._initiate_shoot(p)
-            elif "pass" in act and p.has_ball:
-                target_id = act["pass"]
-                target = next((m for m in players if m.id == target_id), None)
-                if target:
-                    self._initiate_pass(p, target)
+def init_team_a():
+    # 4-3-3
+    base = [
+        (5.0, 34.0, 'GK'),
+        (15.0, 10.0, 'LB'),
+        (15.0, 25.0, 'CB'),
+        (15.0, 43.0, 'CB'),
+        (15.0, 58.0, 'RB'),
+        (30.0, 15.0, 'CM'),
+        (30.0, 34.0, 'CM'),
+        (30.0, 53.0, 'CM'),
+        (45.0, 10.0, 'LW'),
+        (50.0, 34.0, 'ST'),
+        (45.0, 58.0, 'RW'),
+    ]
+    players = []
+    for i, (x, y, role) in enumerate(base):
+        x += random.uniform(-1, 1)
+        y += random.uniform(-1, 1)
+        players.append(init_player(i, 'A', x, y, role))
+    return players
+
+def init_team_b():
+    # 4-4-2 mirror
+    base = [
+        (100.0, 34.0, 'GK'),
+        (90.0, 10.0, 'RB'),
+        (90.0, 25.0, 'CB'),
+        (90.0, 43.0, 'CB'),
+        (90.0, 58.0, 'LB'),
+        (75.0, 15.0, 'RM'),
+        (75.0, 34.0, 'CM'),
+        (75.0, 53.0, 'LM'),
+        (60.0, 20.0, 'RW'),
+        (55.0, 34.0, 'ST'),
+        (60.0, 48.0, 'LW'),
+    ]
+    players = []
+    for i, (x, y, role) in enumerate(base):
+        x += random.uniform(-1, 1)
+        y += random.uniform(-1, 1)
+        players.append(init_player(i, 'B', x, y, role))
+    return players
+
+def init_ball():
+    return {
+        'pos': np.array([FIELD_WIDTH/2, FIELD_HEIGHT/2], dtype=float),
+        'vel': np.zeros(2, dtype=float),
+        'last_kicker_team': None,
+        'spin': np.zeros(2),   # spin vector (arbitrary)
+    }
+
+# ---------- Player Movement ----------
+def apply_movement(player, desired_vel):
+    """Smoothly accelerate towards desired velocity with agility constraints."""
+    current = player['vel']
+    max_acc = ACCELERATION_DRIBBLE if player['has_ball'] else ACCELERATION_FREE
+    max_speed = MAX_SPEED_DRIBBLE if player['has_ball'] else player['max_speed']
+
+    # Clamp desired velocity to max speed
+    desired = np.array(desired_vel)
+    speed = np.linalg.norm(desired)
+    if speed > max_speed:
+        desired = desired / speed * max_speed
+
+    # Direction change limit (agility)
+    if np.linalg.norm(current) > 0.1 and np.linalg.norm(desired) > 0.1:
+        current_dir = current / np.linalg.norm(current)
+        desired_dir = desired / np.linalg.norm(desired)
+        angle = math.acos(np.clip(np.dot(current_dir, desired_dir), -1, 1))
+        max_angle = AGILITY * DT
+        if angle > max_angle:
+            # Rotate desired direction towards current direction
+            rotation_axis = np.cross(np.append(current_dir, 0), np.append(desired_dir, 0))[2]
+            if rotation_axis > 0:
+                rot_matrix = np.array([[math.cos(max_angle), -math.sin(max_angle)],
+                                       [math.sin(max_angle), math.cos(max_angle)]])
             else:
-                p.vx *= 0.9; p.vy *= 0.9
+                rot_matrix = np.array([[math.cos(max_angle), math.sin(max_angle)],
+                                       [-math.sin(max_angle), math.cos(max_angle)]])
+            desired = speed * (rot_matrix @ desired_dir)
 
-    def _initiate_pass(self, passer, target):
-        dx, dy = target.x - passer.x, target.y - passer.y
-        dist = np.hypot(dx, dy)
-        if dist < 0.1: return
-        self.ball.vx = dx / dist * PASS_SPEED
-        self.ball.vy = dy / dist * PASS_SPEED
-        passer.has_ball = False
-        self.ball.possessor = None
-        self.ball.last_touch_team = passer.team
-        self.passes_in_flight.append({
-            'team': passer.team, 'passer': passer,
-            'target_id': target.id, 'target_pos': (target.x, target.y),
-            'start_step': self.step_count
-        })
+    # Acceleration limit
+    vel_diff = desired - current
+    diff_mag = np.linalg.norm(vel_diff)
+    max_diff = max_acc * DT
+    if diff_mag > max_diff:
+        vel_diff = vel_diff / diff_mag * max_diff
+    player['vel'] = current + vel_diff
 
-    def _initiate_shoot(self, shooter):
-        goal_y = np.random.uniform(GOAL_Y_MIN + 0.5, GOAL_Y_MAX - 0.5)
-        goal_x = FIELD_LENGTH if shooter.team == 'A' else 0
-        dx, dy = goal_x - shooter.x, goal_y - shooter.y
-        dist = np.hypot(dx, dy)
-        if dist > 0:
-            self.ball.vx = dx / dist * SHOOT_SPEED
-            self.ball.vy = dy / dist * SHOOT_SPEED
-        shooter.has_ball = False
-        self.ball.possessor = None
-        self.ball.last_touch_team = shooter.team
+def update_player_positions(players):
+    """Move players according to their velocities, clamp inside field."""
+    for p in players:
+        p['pos'] += p['vel'] * DT
+        p['pos'][0] = clamp(p['pos'][0], 0, FIELD_WIDTH)
+        p['pos'][1] = clamp(p['pos'][1], 0, FIELD_HEIGHT)
 
-    def _update_physics(self):
-        for p in self.all_players():
-            p.x += p.vx * DT; p.y += p.vy * DT
-            p.x = max(PLAYER_RADIUS, min(FIELD_LENGTH-PLAYER_RADIUS, p.x))
-            p.y = max(PLAYER_RADIUS, min(FIELD_WIDTH-PLAYER_RADIUS, p.y))
-            p.vx *= 0.98; p.vy *= 0.98
-            if abs(p.vx) < 0.05: p.vx = 0
-            if abs(p.vy) < 0.05: p.vy = 0
-            if p.has_ball:
-                self.ball.x, self.ball.y = p.x, p.y
-        if self.ball.possessor is None:
-            self.ball.x += self.ball.vx * DT; self.ball.y += self.ball.vy * DT
-            self.ball.vx *= BALL_FRICTION; self.ball.vy *= BALL_FRICTION
-        # collisions
-        players = self.all_players()
-        for i in range(len(players)):
-            for j in range(i+1, len(players)):
-                pi, pj = players[i], players[j]
-                dx, dy = pi.x - pj.x, pi.y - pj.y
-                dist = np.hypot(dx, dy)
-                if dist < 2*PLAYER_RADIUS and dist > 0:
-                    overlap = 2*PLAYER_RADIUS - dist
-                    nx, ny = dx/dist, dy/dist
-                    pi.x += nx*overlap/2; pi.y += ny*overlap/2
-                    pj.x -= nx*overlap/2; pj.y -= ny*overlap/2
+# ---------- Ball Physics ----------
+def update_ball(ball, players):
+    """Apply drag, roll, spin, and collision with players. No goal check here."""
+    # Air drag
+    speed = np.linalg.norm(ball['vel'])
+    if speed > 0.01:
+        drag_force = 0.5 * AIR_DENSITY * BALL_CROSS_SECTION * DRAG_COEFF * speed**2
+        drag_acc = drag_force / BALL_MASS
+        drag_vec = -ball['vel'] / speed * drag_acc * DT
+        ball['vel'] += drag_vec
+    # Rolling friction (simulate ground contact)
+    ball['vel'] *= ROLLING_FRICTION
+    # Spin (Magnus effect, simplified)
+    if np.linalg.norm(ball['spin']) > 0:
+        perp = np.array([ball['spin'][1], -ball['spin'][0]])
+        ball['vel'] += SPIN_FACTOR * perp * np.linalg.norm(ball['vel']) * DT
+        ball['spin'] *= 0.99
+    ball['pos'] += ball['vel'] * DT
 
-    def _check_events(self):
-        events = {'goal_a': False, 'goal_b': False, 'out': False}
-        if self.ball.x > FIELD_LENGTH and GOAL_Y_MIN <= self.ball.y <= GOAL_Y_MAX:
-            events['goal_a'] = True; self.score_a += 1
-            self._reset_after_goal('B')
-        elif self.ball.x < 0 and GOAL_Y_MIN <= self.ball.y <= GOAL_Y_MAX:
-            events['goal_b'] = True; self.score_b += 1
-            self._reset_after_goal('A')
-        elif self.ball.x < 0 or self.ball.x > FIELD_LENGTH or self.ball.y < 0 or self.ball.y > FIELD_WIDTH:
-            events['out'] = True
-            if self.ball.last_touch_team == 'A': self._assign_ball_to_nearest('B')
-            else: self._assign_ball_to_nearest('A')
-            self.ball.x = FIELD_LENGTH/2; self.ball.y = FIELD_WIDTH/2
-            self.ball.vx = self.ball.vy = 0
-        return events
+    # Check collision with players (bounce)
+    for p in players:
+        dist = np.linalg.norm(ball['pos'] - p['pos'])
+        min_dist = PLAYER_RADIUS + BALL_RADIUS
+        if dist < min_dist and np.linalg.norm(ball['vel']) > 1.0:
+            # Elastic bounce with player (player mass = infinite)
+            normal = (ball['pos'] - p['pos']) / (dist + 1e-6)
+            v_rel = ball['vel'] - p['vel']
+            vn = np.dot(v_rel, normal)
+            if vn < 0:   # ball moving towards player
+                # reflect
+                ball['vel'] -= 2 * vn * normal
+                # add player velocity influence
+                ball['vel'] += p['vel'] * 0.3
+                # separate
+                ball['pos'] = p['pos'] + normal * (min_dist + 0.01)
 
-    def _reset_after_goal(self, kickoff_team):
-        self.reset()
-        self.ball.last_touch_team = kickoff_team
-        self._assign_ball_to_nearest(kickoff_team)
+    # Out-of-bounds will be handled in environment
 
-    def _update_possession(self):
-        if self.ball.possessor is None:
-            for p in self.all_players():
-                if not p.has_ball and np.hypot(p.x-self.ball.x, p.y-self.ball.y) < POSS_DIST:
-                    p.has_ball = True; self.ball.possessor = p
-                    self.ball.last_touch_team = p.team
-                    self.ball.vx = self.ball.vy = 0.0
-                    self.ball.x, self.ball.y = p.x, p.y
-                    break
-        if self.ball.possessor is not None:
-            carrier = self.ball.possessor
-            opps = self.team_b if carrier.team == 'A' else self.team_a
-            for opp in opps:
-                dist = np.hypot(carrier.x-opp.x, carrier.y-opp.y)
-                if dist < TACKLE_DIST:
-                    prob = min(1.0, 2.0 * (1 - dist/TACKLE_DIST))
-                    if np.random.random() < prob:
-                        carrier.has_ball = False
-                        opp.has_ball = True
-                        self.ball.possessor = opp
-                        self.ball.last_touch_team = opp.team
-                        self.ball.vx = self.ball.vy = 0.0
-                        self.ball.x, self.ball.y = opp.x, opp.y
-                        break
+# ---------- Possession & Tackling ----------
+def check_possession(players, ball):
+    """Give possession to nearest player of the opposite team from last kicker."""
+    min_dist = float('inf')
+    possessor = -1
+    for p in players:
+        if p['team'] == ball['last_kicker_team']:
+            continue
+        d = np.linalg.norm(p['pos'] - ball['pos'])
+        if d < PLAYER_RADIUS + BALL_RADIUS + 0.2 and d < min_dist:
+            min_dist = d
+            possessor = p['id']
+    return possessor
 
-    def _update_passes(self):
-        for flight in self.passes_in_flight[:]:
-            if self.ball.possessor is not None or self.step_count - flight['start_step'] > 30:
-                self.passes_in_flight.remove(flight); continue
-            opp_team = self.team_b if flight['team'] == 'A' else self.team_a
-            for opp in opp_team:
-                if np.hypot(opp.x-self.ball.x, opp.y-self.ball.y) < INTERCEPT_DIST:
-                    self.pass_events.append({'type':'intercept', 'team':flight['team']})
-                    opp.has_ball = True; self.ball.possessor = opp
-                    self.ball.last_touch_team = opp.team
-                    self.ball.vx = self.ball.vy = 0.0
-                    self.ball.x, self.ball.y = opp.x, opp.y
-                    self.passes_in_flight.remove(flight); return
-            tx, ty = flight['target_pos']
-            if np.hypot(self.ball.x-tx, self.ball.y-ty) < 2.0:
-                self.pass_events.append({'type':'success', 'team':flight['team']})
-                target = next((p for p in (self.team_a if flight['team']=='A' else self.team_b) if p.id == flight['target_id']), None)
-                if target:
-                    target.has_ball = True; self.ball.possessor = target
-                    self.ball.last_touch_team = flight['team']
-                    self.ball.vx = self.ball.vy = 0.0
-                    self.ball.x, self.ball.y = target.x, target.y
-                self.passes_in_flight.remove(flight)
+def handle_tackles(players, ball):
+    """Realistic tackle logic: successful if attacker is within tackle distance, 
+    approaching from a suitable angle, and close enough to the carrier."""
+    carrier = None
+    for p in players:
+        if p['has_ball']:
+            carrier = p
+            break
+    if not carrier:
+        return False
 
-    def get_state_dict(self):
-        return {
-            'step': self.step_count,
-            'score': f"{self.score_a}-{self.score_b}",
-            'ball': {'x':self.ball.x, 'y':self.ball.y, 'vx':self.ball.vx, 'vy':self.ball.vy},
-            'possession_team': self.ball.last_touch_team,
-            'team_a': [{'id':p.id, 'x':p.x, 'y':p.y, 'vx':p.vx, 'vy':p.vy, 'has_ball':p.has_ball} for p in self.team_a],
-            'team_b': [{'id':p.id, 'x':p.x, 'y':p.y, 'vx':p.vx, 'vy':p.vy, 'has_ball':p.has_ball} for p in self.team_b],
-        }
+    for p in players:
+        if p['team'] == carrier['team'] or p['id'] == carrier['id']:
+            continue
+        dist = np.linalg.norm(p['pos'] - carrier['pos'])
+        if dist < TACKLE_DIST:
+            # Angle check: defender should be facing the carrier or at least moving toward them
+            carrier_to_def = p['pos'] - carrier['pos']
+            if np.linalg.norm(carrier_to_def) < 0.01:
+                continue
+            angle = math.degrees(math.acos(np.dot(p['vel']/max(np.linalg.norm(p['vel']),1e-6), 
+                                            carrier_to_def/np.linalg.norm(carrier_to_def))))
+            if angle < TACKLE_ANGLE_THRESH:
+                prob = TACKLE_SUCCESS_BASE * (1 - dist/TACKLE_DIST)
+                if random.random() < prob:
+                    carrier['has_ball'] = False
+                    p['has_ball'] = True
+                    ball['last_kicker_team'] = carrier['team']
+                    return True
+    return False
+
+# ---------- Passing ----------
+def execute_pass(passer, target_id, team_players, opponents, ball):
+    """Launch a pass towards the target's position, with error based on pressure and distance."""
+    target = None
+    for p in team_players:
+        if p['id'] == target_id:
+            target = p
+            break
+    if not target:
+        return 'invalid'
+
+    target_pos = target['pos'].copy()
+    dist = np.linalg.norm(target_pos - passer['pos'])
+    # Error: reduces accuracy
+    pressure = 0
+    for opp in opponents:
+        if np.linalg.norm(opp['pos'] - passer['pos']) < 2.0:
+            pressure += 1
+    accuracy = PASS_ACCURACY * (1 - 0.3*min(pressure,3)/3) * (1 - 0.005*dist)   # distance penalty
+    error = (1 - accuracy) * random.uniform(-1,1) * 2.0   # meters of deviation
+    # Add lateral error to target position
+    dir_vec = target_pos - passer['pos']
+    perp = np.array([-dir_vec[1], dir_vec[0]]) / (np.linalg.norm(dir_vec)+1e-6)
+    target_pos += perp * error
+
+    direction = target_pos - passer['pos']
+    dir_len = np.linalg.norm(direction)
+    if dir_len == 0:
+        return 'invalid'
+    vel = direction / dir_len * PASS_SPEED
+    ball['vel'] = vel
+    ball['pos'] = passer['pos'].copy()
+    ball['spin'] = np.array([0.0, random.uniform(-0.5,0.5)])   # slight random spin
+    return {
+        'from': passer['id'],
+        'to': target_id,
+        'steps_left': PASS_TIME_STEPS,
+        'intercepted': False,
+        'arrived': False,
+    }
+
+def check_pass_interception(ball, opponents):
+    """Check if any opponent is within interception distance of the ball,
+    and is facing/reacting to the ball."""
+    for opp in opponents:
+        dist = np.linalg.norm(opp['pos'] - ball['pos'])
+        # Reaction time: if opponent is stationary or not looking, they might miss
+        # Simplified: just distance check
+        if dist < INTERCEPT_DIST:
+            return True
+    return False
+
+def handle_pass_in_env(pass_info, players, ball, opponents):
+    """Update the pass state each step, using realistic interception."""
+    pass_info['steps_left'] -= 1
+    target = next((p for p in players if p['id'] == pass_info['to']), None)
+    if not target:
+        return 'timeout'
+
+    if np.linalg.norm(ball['pos'] - target['pos']) < PASS_ARRIVE_DIST:
+        target['has_ball'] = True
+        ball['vel'] = np.zeros(2)
+        ball['spin'] = np.zeros(2)
+        return 'success'
+
+    if check_pass_interception(ball, opponents):
+        pass_info['intercepted'] = True
+        closest = min(opponents, key=lambda o: np.linalg.norm(o['pos'] - ball['pos']))
+        closest['has_ball'] = True
+        ball['vel'] = np.zeros(2)
+        ball['spin'] = np.zeros(2)
+        return 'intercepted'
+
+    if pass_info['steps_left'] <= 0:
+        return 'timeout'
+    return 'ongoing'
+
+# ---------- Shooting ----------
+def execute_shoot(player, attacking_right, ball):
+    """Shoot with accuracy decreasing with distance and pressure. Include chance of post."""
+    if attacking_right:
+        goal_center = np.array([FIELD_WIDTH, GOAL_Y_CENTER])
+    else:
+        goal_center = np.array([0.0, GOAL_Y_CENTER])
+    dist = np.linalg.norm(goal_center - player['pos'])
+    pressure = sum(1 for p in opponents(player['team']) if np.linalg.norm(p['pos'] - player['pos']) < 2.0)
+    accuracy = SHOT_ACCURACY * (1 - 0.5*min(pressure,3)/3) * (1 - 0.01*dist)
+    error_y = random.uniform(-1,1) * (1-accuracy) * 3.0   # metres off target
+    target_y = clamp(GOAL_Y_CENTER + error_y, GOAL_Y_MIN+0.3, GOAL_Y_MAX-0.3)
+    target_pos = np.array([goal_center[0], target_y])
+    direction = target_pos - player['pos']
+    shot_speed = SHOT_SPEED * random.uniform(0.9, 1.1)
+    vel = direction / np.linalg.norm(direction) * shot_speed
+    ball['vel'] = vel
+    ball['pos'] = player['pos'].copy()
+    ball['spin'] = np.array([0.0, random.uniform(-1,1)])
+    ball['last_kicker_team'] = player['team']
+
+def opponents(team):
+    """Helper placeholder for team B logic – we don't have global access, so this is for conceptual use.
+    In the environment, you'll pass the opponent list directly."""
+    pass
+
+# ---------- Goal & Offside ----------
+def check_goal(ball, for_team_A):
+    if for_team_A:
+        return ball['pos'][0] >= FIELD_WIDTH and GOAL_Y_MIN <= ball['pos'][1] <= GOAL_Y_MAX
+    else:
+        return ball['pos'][0] <= 0 and GOAL_Y_MIN <= ball['pos'][1] <= GOAL_Y_MAX
+
+def is_offside(passer, receiver, defenders):
+    """FIFA rule: offside if receiver is nearer to opponent's goal line than both the ball and the second-last opponent
+    (excluding the goalkeeper) at the moment the ball is played."""
+    if passer['team'] == 'A':
+        opponent_goal_line = FIELD_WIDTH
+        # defenders is list of Team B players
+        field_players = [p for p in defenders if p.get('role') != 'GK']
+        if len(field_players) < 2:
+            return False   # need at least two outfield opponents
+        # Sort by x coordinate (for Team B defending left, smaller x = closer to own goal)
+        sorted_x = sorted([p['pos'][0] for p in field_players])
+        second_last_x = sorted_x[-2]   # second last outfield player (penultimate)
+        ball_x = passer['pos'][0]      # ball is at passer's feet
+        # Offside conditions: receiver is ahead of the ball AND ahead of second-last defender
+        if receiver['pos'][0] > ball_x and receiver['pos'][0] > second_last_x:
+            return True
+        return False
+    else:   # Team B attacking left
+        opponent_goal_line = 0.0
+        field_players = [p for p in defenders if p.get('role') != 'GK']
+        if len(field_players) < 2:
+            return False
+        sorted_x = sorted([p['pos'][0] for p in field_players])
+        second_last_x = sorted_x[1]   # second last (closer to B's goal is larger x, so second last is index 1)
+        ball_x = passer['pos'][0]
+        if receiver['pos'][0] < ball_x and receiver['pos'][0] < second_last_x:
+            return True
+        return False
+
+# ---------- Out-of-bounds (realistic restarts) ----------
+def out_of_bounds(ball):
+    """Return (True, restart_type, team_possession) based on where ball went out.
+    restart_type: 'throw-in', 'goal-kick', 'corner', 'kick-off'
+    team_possession: 'A' or 'B' who gets the ball."""
+    x, y = ball['pos']
+    # L/R touchlines
+    if x < 0:
+        if GOAL_Y_MIN <= y <= GOAL_Y_MAX:
+            # Ball went into left goal (already handled by goal checker)
+            return False, None, None
+        elif y < 0 or y > FIELD_HEIGHT:
+            # corner area? simplified
+            return True, 'corner' if y < FIELD_HEIGHT/2 else 'corner', 'A' if x < 0 else 'B'
+        else:
+            return True, 'throw-in', 'A' if x < 0 else 'B'
+    if x > FIELD_WIDTH:
+        if GOAL_Y_MIN <= y <= GOAL_Y_MAX:
+            return False, None, None
+        elif y < 0 or y > FIELD_HEIGHT:
+            return True, 'corner', 'B' if x > FIELD_WIDTH else 'A'
+        else:
+            return True, 'throw-in', 'B' if x > FIELD_WIDTH else 'A'
+    # End lines (goal lines)
+    if y < 0 or y > FIELD_HEIGHT:
+        return True, 'throw-in', 'A' if y < 0 else 'B'   # simple throw-in
+    return False, None, None
